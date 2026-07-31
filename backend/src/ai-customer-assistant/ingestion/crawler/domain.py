@@ -9,7 +9,7 @@ class RawPage:
     content_type: Optional[str] = None
 
 @dataclass(frozen=True)
-class ExtractedContend:
+class ExtractedContent:
     url: str
     title: Optional[str]
     html: str
