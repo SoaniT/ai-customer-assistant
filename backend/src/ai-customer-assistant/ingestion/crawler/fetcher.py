@@ -1,22 +1,23 @@
+import asyncio
 import httpx
-from .domain import RawPage
+from .config import CrawlConfig
+from .models import FetchedPage
+from .exception import FetchError
 
-async def fetch_page(url: str, client: httpx.AsyncClient, timeout:float = 15.0) -> RawPage:
-    """
-    Fetches a web page and returns a RawPage object containing the URL, status code, HTML content, and content type.
+async def fetch_page(url: str, client: httpx.AsyncClient, config: CrawlConfig) -> FetchedPage:
+    async def attempt(remaining: int) -> FetchedPage:
+        try:
+            response = await client.get(
+                url,
+                timeout=config.request_timeout,
+                follow_redirects=config.follow_redirects,
+                headers={"User-Agent": config.user_agent},
+            )
+            return FetchedPage(url=str(response.url), status_code=response.status_code, html=response.text)
+        except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPError) as e:
+            if remaining <= 0:
+                raise FetchError(f"{url}: {e}") from e
+            await asyncio.sleep(config.delay_between_requests)
+            return await attempt(remaining - 1)
 
-    Args:
-        url (str): The URL of the web page to fetch.
-        client (httpx.AsyncClient): An instance of httpx.AsyncClient for making HTTP requests.
-        timeout (float): The timeout for the request in seconds. Default is 15.0 seconds.
-
-    Returns:
-        RawPage: An object containing the URL, status code, HTML content, and content type.
-    """
-    response = await client.get(url, timeout=timeout, follow_redirects=True)
-    return RawPage(
-        url = str(response.url),
-        status_code = response.status_code,
-        html = response.text,
-        content_type = response.headers.get("content-type", ""),
-    )
+    return await attempt(config.retry_count)

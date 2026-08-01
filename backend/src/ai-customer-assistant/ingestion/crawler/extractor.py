@@ -1,25 +1,26 @@
-from urllib.parse import urljoin
-from bs4 import BeautifulSoup
-from .domain import RawPage, ExtractedContent
+import trafilatura
+from trafilatura.metadata import extract_metadata
+from .models import PageMeta
+from .exception import ExtractionError
 
-STRIP_TAGS = ("script", "style", "nav", "footer", "header", "noscript", "svg")
+def extract_markdown(html_text: str, url: str) -> str:
+    markdown = trafilatura.extract(
+        html_text,
+        url=url,
+        output_format="markdown",
+        include_tables=True,
+        include_links=True,
+        include_images=True,
+        favor_precision=True,
+    )
+    if markdown is None:
+        raise ExtractionError(f"Trafilatura could not extract content from {url}")
+    return markdown
 
-def clean_soup(html: str) -> BeautifulSoup:
-    soup = BeautifulSoup(html, "html.parser")
-    tuple(tag.decompose() for tag in soup.find_all(STRIP_TAGS))
-    return soup
-
-def extract_links(soup: BeautifulSoup, base_url: str) -> tuple[str, ...]:
-    return tuple(sorted({
-        urljoin(base_url, a["href"])
-        for a in soup.find_all("a", href=True)
-        if not a["href"].startswith(("mailto:", "javascript:", "#"))
-    }))
-
-def extract_content(page: RawPage) -> ExtractedContent:
-    soup = clean_soup(page.html)
-    title = (soup.title.string.strip() if soup.title and soup.title.string else page.url)
-    main = soup.find("main") or soup.find("article") or soup.body or soup
-    return ExtractedContent(
-        url=page.url, title=title, html=str(main), text=main.get_text(" ", strip=True)
+def extract_meta(html_text: str, url: str) -> PageMeta:
+    meta = extract_metadata(html_text, default_url=url)
+    return PageMeta(
+        title=(meta.title if meta and meta.title else url),
+        canonical_url=(meta.url if meta and meta.url else url),
+        description=(meta.description if meta and meta.description else ""),
     )
