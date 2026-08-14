@@ -26,3 +26,17 @@ RUN chmod +x scripts/entrypoint.sh
 EXPOSE 8000
 
 ENTRYPOINT ["scripts/entrypoint.sh"]
+
+# 1. Prevent hard-link failures across cache boundaries and turn on bytecode compilation
+ENV UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1
+
+# 2. Add an explicit cache ID to prevent re-downloads on failure
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    uv sync --no-install-project --no-progress
+
+COPY . .
+
+# 3. Mount the same cache for the final project sync so it doesn't re-download CUDA wheels
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    uv sync

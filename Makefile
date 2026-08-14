@@ -99,3 +99,15 @@ trunc:
 
 user:
 	docker exec -i ai-customer-assistant-postgres psql -U ai_assistant -d ai_customer_assistant -c "INSERT INTO app_user (id, email, is_service_account) VALUES ('00000000-0000-0000-0000-000000000000','admin@admin.com', True);"
+
+show-md: ## Show the stored markdown for a crawled URL (make show-md URL="https://...")
+	@if [ -z "$(URL)" ]; then \
+		read -p "Enter URL: " TARGET_URL; \
+	else \
+		TARGET_URL="$(URL)"; \
+	fi; \
+	KEY=$$(docker exec -i ai-customer-assistant-postgres psql -U ai_assistant -d ai_customer_assistant -t -A -c \
+		"SELECT ksv.storage_uri FROM knowledge_source ks JOIN knowledge_source_version ksv ON ksv.source_id = ks.source_id WHERE ks.source_name = '$$TARGET_URL' ORDER BY ksv.created_at DESC LIMIT 1;"); \
+	if [ -z "$$KEY" ]; then echo "No source found matching: $$TARGET_URL"; exit 1; fi; \
+	echo "→ $$KEY"; \
+	mc cat "local/$${MINIO_BUCKET:-knowledge-documents}/$$KEY"

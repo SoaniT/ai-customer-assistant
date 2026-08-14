@@ -6,7 +6,9 @@ dedup, MinIO storage, queue row) then run ``run_ingestion`` immediately so
 the result is indexable without a separate worker process.
 
   POST /ingest/upload   multipart file (PDF / DOCX / Markdown)
-  POST /ingest/crawl    JSON {"url": ...} (HTML page or PDF/Office URL)
+  POST /ingest/crawl    JSON {"url": ..., "site": false}
+                        (HTML page or PDF/Office URL; ``site=true`` crawls
+                        the whole domain, one job per page)
 
 Uploaded-by defaults to the system service account
 (``00000000-0000-0000-0000-000000000000``); override with
@@ -18,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
-from typing import Literal
 from uuid import UUID
 
 import httpx
@@ -45,28 +46,6 @@ _UPLOAD_MIME_TO_FILE_TYPE: dict[str, FileType] = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": FileType.DOCX,
     "text/markdown": FileType.MD,
 }
-
-_CRAWL_DOC_MIME_TO_FILE_TYPE: dict[str, FileType | None] = {
-    "application/pdf": FileType.PDF,
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": FileType.DOCX,
-    "application/msword": None,
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation": None,
-    "application/vnd.ms-powerpoint": None,
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": None,
-    "application/vnd.ms-excel": None,
-}
-
-RouteKind = Literal["html", "document"]
-
-
-def _classify_content_type(content_type: str) -> RouteKind:
-    base = content_type.split(";", 1)[0].strip().lower()
-    return "document" if base in _CRAWL_DOC_MIME_TO_FILE_TYPE else "html"
-
-
-def _resolve_file_type(content_type: str) -> FileType | None:
-    base = content_type.split(";", 1)[0].strip().lower()
-    return _CRAWL_DOC_MIME_TO_FILE_TYPE.get(base)
 
 
 async def _run_job(job_id: UUID) -> None:
@@ -185,6 +164,10 @@ async def upload(
 class CrawlRequest(BaseModel):
     url: str = Field(..., min_length=5, max_length=2048)
     category_id: UUID | None = None
+    site: bool = Field(
+        default=False,
+        description="Crawl the entire site under the URL's domain instead of just this page.",
+    )
 
 
 @router.post("/crawl")
@@ -192,44 +175,49 @@ async def crawl(
     req: CrawlRequest,
     session: AsyncSession = Depends(get_session),
 ) -> dict:
+    from ingestion.services.crawl_ingest import crawl_and_register_jobs
+
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-            response = await client.get(req.url)
-            response.raise_for_status()
-            content_type = response.headers.get("content-type", "application/octet-stream")
-            raw_bytes = response.content
+        result = await crawl_and_register_jobs(
+            session,
+            url=req.url,
+            uploaded_by=_uploaded_by(),
+            category_id=req.category_id,
+            site=req.site,
+        )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {exc}") from exc
 
-    route = _classify_content_type(content_type)
+    jobs = result.jobs
+    if jobs:
+        for job in jobs:
+            asyncio.create_task(_run_job(job.job_id))
 
-    if route == "html":
-        # The page body was already fetched above — extract markdown from it
-        # directly instead of re-fetching through the Crawler (which used a
-        # stricter user-agent/timeout and double-fetched the URL).
-        from ingestion.crawler.exception import ExtractionError
-        from ingestion.crawler.extractor import extract_markdown
+        if len(jobs) == 1:
+            job = jobs[0]
+            resp: dict = {
+                "status": "submitted",
+                "job_id": str(job.job_id),
+                "source_id": str(job.source_id),
+                "version_id": str(job.version_id),
+            }
+        else:
+            resp = {
+                "status": "submitted",
+                "job_ids": [str(job.job_id) for job in jobs],
+                "source_ids": [str(job.source_id) for job in jobs],
+                "version_ids": [str(job.version_id) for job in jobs],
+                "pages": len(jobs),
+            }
+        if result.failures:
+            resp["failed_pages"] = len(result.failures)
+        return resp
 
-        final_url = str(response.url)
-        html = raw_bytes.decode("utf-8", errors="replace")
-        try:
-            markdown = extract_markdown(html, final_url)
-        except ExtractionError as exc:
-            raise HTTPException(status_code=502, detail=f"Crawl failed: {exc}") from exc
-        return await _register_and_run(
-            session,
-            url=final_url,
-            raw_bytes=markdown.encode("utf-8"),
-            mime_type="text/markdown",
-            file_type=FileType.MD,
-            category_id=req.category_id,
-        )
+    if result.failures:
+        failed_url, reason = result.failures[0]
+        detail = f"Crawl failed for {failed_url}: {reason}"
+        if len(result.failures) > 1:
+            detail += f" ({len(result.failures) - 1} more page(s) failed)"
+        raise HTTPException(status_code=502, detail=detail)
 
-    return await _register_and_run(
-        session,
-        url=req.url,
-        raw_bytes=raw_bytes,
-        mime_type=content_type,
-        file_type=_resolve_file_type(content_type),
-        category_id=req.category_id,
-    )
+    return {"status": "duplicate_skipped"}

@@ -1,50 +1,30 @@
 #!/usr/bin/env python
 """
-Crawl a single URL and ingest it end-to-end.
+Crawl a URL and ingest it end-to-end.
 
     uv run --project backend python scripts/crawl_and_ingest.py https://example.com/handbook
+    uv run --project backend python scripts/crawl_and_ingest.py --site https://example.com
     uv run --project backend python scripts/crawl_and_ingest.py https://example.com/handbook.pdf
 
 Routing is decided purely by the fetched Content-Type (a pure function,
-`classify_content_type`, see below) -- not by file extension:
+`classify_content_type` in ingestion/services/crawl_ingest.py):
 
-  * text/html                          -> ingestion.crawler.Crawler (mode=PAGE)
-                                           fetches + converts to markdown via
-                                           trafilatura; the markdown is then
-                                           registered as an MD version and
+  * text/html                          -> ingestion.crawler.Crawler (PAGE or
+                                           SITE mode) converts the page(s) to
+                                           markdown via trafilatura; each page
+                                           is registered as an MD version and
                                            flows through the SAME pipeline as
-                                           everything else (Tika passes
-                                           markdown through essentially
-                                           unparsed, per the Tika reference
-                                           doc section 6 -- no separate
-                                           no-Tika code path needed).
+                                           everything else.
   * pdf / doc / docx / ppt / pptx /
     xls / xlsx (any Office or PDF type) -> raw bytes are registered as-is;
                                            Tika extracts the text during
                                            ingestion, same as an uploaded file.
 
-Either branch ends with one queued `knowledge_injection_job`, which this
-script then runs immediately through the same `run_ingestion` the
-background worker uses -- so a one-shot CLI call gives you a fully indexed
-document without needing the worker running.
-
-CONFIRMED against the real crawler.py / queues.py / io_output.py:
-io_output.py only writes markdown to local disk -- it does NOT store to
-MinIO or queue a job. That means the "crawler already stores to MinIO and
-queues a job" README note refers to some other code path not seen here;
-this script does the store+queue step itself, via
-ingestion.queue.document_producer.register_document_version, reused for
-both the HTML/markdown path and the PDF/Office path.
-
-STILL AN ASSUMPTION: exact required/default fields of
-ingestion.crawler.config.CrawlConfig beyond `mode` -- confirm it has
-sensible defaults for concurrent_requests/max_pages/max_depth/
-allowed_domains (unused in PAGE mode, but may still need defaults at
-construction time).
-
-NOTE: CrawlMode.PAGE returns exactly one CrawlDocument. CrawlMode.SITE
-would return many (a full site crawl) -- ingesting all of them as separate
-sources isn't handled here; ask if you want a --mode site option added.
+Each registered version produces a queued `knowledge_injection_job`, which
+this script then runs immediately through the same `run_ingestion` the
+background worker uses -- so a one-shot CLI call gives you fully indexed
+document(s) without needing the worker running. A site crawl (--site)
+registers one job per crawled page, capped at CrawlConfig.max_pages.
 """
 
 from __future__ import annotations
@@ -53,14 +33,11 @@ import argparse
 import asyncio
 import logging
 import sys
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 from uuid import UUID
 
-import httpx
 from dotenv import load_dotenv
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")  # backend/.env
 
@@ -71,142 +48,15 @@ _PKG_ROOT = Path(__file__).resolve().parent.parent / "src" / "ai_customer_assist
 if str(_PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(_PKG_ROOT))
 
-from ingestion.pipeline_types import FileType, JobType
-from ingestion.queue.document_producer import register_document_version
+from ingestion.pipeline_types import JobRef, JobStatus, JobType
+from ingestion.services.crawl_ingest import crawl_and_register_jobs
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Data layer: the closed vocabulary Tika/Office/PDF mime types map onto.
-# schema.md's file_type enum only has PDF | DOCX | MD -- everything else
-# maps to None (allowed, nullable) and keeps its real type in mime_type.
-# ---------------------------------------------------------------------------
-
-_DOCUMENT_MIME_TO_FILE_TYPE: dict[str, FileType | None] = {
-    "application/pdf": FileType.PDF,
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": FileType.DOCX,
-    "application/msword": None,  # legacy .doc -- no enum value, see NOTE above
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation": None,  # .pptx
-    "application/vnd.ms-powerpoint": None,  # .ppt
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": None,  # .xlsx
-    "application/vnd.ms-excel": None,  # .xls
-}
-
-RouteKind = Literal["html", "document"]
-
-
-def classify_content_type(content_type: str) -> RouteKind:
-    """Pure: decide which ingestion path a fetched Content-Type takes."""
-    base_type = content_type.split(";", 1)[0].strip().lower()
-    return "document" if base_type in _DOCUMENT_MIME_TO_FILE_TYPE else "html"
-
-
-def resolve_file_type(content_type: str) -> FileType | None:
-    """Pure: map a document mime type to the schema's (limited) enum."""
-    base_type = content_type.split(";", 1)[0].strip().lower()
-    return _DOCUMENT_MIME_TO_FILE_TYPE.get(base_type)
-
-
-@dataclass(frozen=True, slots=True)
-class FetchedUrl:
-    url: str
-    content_type: str
-    raw_bytes: bytes
-
-
-def fetch_url(url: str, *, client: httpx.Client) -> FetchedUrl:
-    """
-    The single I/O call that decides routing (HTML vs document). Kept as a
-    plain httpx call rather than the crawler's own fetcher, since this is
-    only used to sniff Content-Type before deciding whether to hand off to
-    Crawler at all -- Crawler does its own fetch once we know it's HTML.
-    """
-    response = client.get(url, follow_redirects=True, timeout=30.0)
-    response.raise_for_status()
-    content_type = response.headers.get("content-type", "application/octet-stream")
-    return FetchedUrl(url=url, content_type=content_type, raw_bytes=response.content)
-
-
-# ---------------------------------------------------------------------------
-# HTML path -- real Crawler API confirmed: Crawler(config).crawl(url) ->
-# tuple[CrawlDocument, ...]. io_output.py only saves to local disk, so the
-# MinIO + queue step happens here, reusing document_producer with file_type=MD.
-# ---------------------------------------------------------------------------
-
-
-async def _run_html_crawler_pipeline(
-    session: AsyncSession,
-    fetched: FetchedUrl,
-    *,
-    uploaded_by: UUID,
-    category_id: UUID | None,
-    mode,  # ingestion.crawler.config.CrawlMode
-) -> tuple[UUID, ...]:
-    from urllib.parse import urlsplit
-    from ingestion.crawler.config import CrawlConfig
-    from ingestion.crawler.crawler import Crawler
-
-    # Constrain the crawl to the starting URL's own domain, same as
-    # crawler/__main__.py's _config_for -- otherwise CrawlMode.SITE will
-    # follow every external link it finds.
-    domain = urlsplit(fetched.url).netloc
-    config = CrawlConfig(mode=mode, allowed_domains=(domain,))
-    documents = await Crawler(config).crawl(fetched.url)
-
-    if not documents:
-        logger.error("crawl failed for %s: no documents returned", fetched.url)
-        return ()
-
-    job_ids: list[UUID] = []
-    for doc in documents:
-        if doc.error is not None:
-            logger.error("crawl failed for %s: %s", doc.url, doc.error)
-            continue
-        job = await register_document_version(
-            session,
-            url=doc.url,
-            raw_bytes=doc.markdown.encode("utf-8"),
-            mime_type="text/markdown",
-            file_type=FileType.MD,
-            uploaded_by=uploaded_by,
-            category_id=category_id,
-        )
-        if job is not None:
-            job_ids.append(job.job_id)
-
-    return tuple(job_ids)
-
-# ---------------------------------------------------------------------------
-# Document (PDF/Office) path -- new code, doesn't touch the crawler package.
-# ---------------------------------------------------------------------------
-
-
-async def _run_document_pipeline(
-    session: AsyncSession, fetched: FetchedUrl, *, uploaded_by: UUID, category_id: UUID | None, mode
-) -> tuple[UUID, ...]:
-    job = await register_document_version(
-        session,
-        url=fetched.url,
-        raw_bytes=fetched.raw_bytes,
-        mime_type=fetched.content_type,
-        file_type=resolve_file_type(fetched.content_type),
-        uploaded_by=uploaded_by,
-        category_id=category_id,
-    )
-    return (job.job_id,) if job is not None else ()
-
 
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
-# route -> handler. Both now share the same signature (session, fetched, *,
-# uploaded_by, category_id) -> UUID | None, since both end up going through
-# register_document_version -- replaces an if/elif on `route`.
-_ROUTES = {
-    "html": _run_html_crawler_pipeline,
-    "document": _run_document_pipeline,
-}
 
 async def crawl_and_ingest(
     url: str,
@@ -216,43 +66,42 @@ async def crawl_and_ingest(
     session_factory: async_sessionmaker,
     site: bool = False,
 ) -> None:
-    from ingestion.crawler.config import CrawlMode
-
-    with httpx.Client() as http_client:
-        fetched = fetch_url(url, client=http_client)
-
-    route = classify_content_type(fetched.content_type)
-    mode = CrawlMode.SITE if site else CrawlMode.PAGE
-    logger.info("routing %s as %s (content-type: %s, mode: %s)", url, route, fetched.content_type, mode)
-
     async with session_factory() as session:
-        job_ids = await _ROUTES[route](session, fetched, uploaded_by=uploaded_by, category_id=category_id, mode=mode)
+        result = await crawl_and_register_jobs(
+            session,
+            url=url,
+            uploaded_by=uploaded_by,
+            category_id=category_id,
+            site=site,
+        )
+        job_rows = tuple(result.jobs)
+        failures = tuple(result.failures)
 
-    if not job_ids:
+    for failed_url, reason in failures:
+        logger.error("crawl failed for %s: %s", failed_url, reason)
+
+    if not job_rows:
         return
 
-    from db.models import KnowledgeInjectionJob
+    logger.info("%d page(s) queued from %s -- ingesting each now", len(job_rows), url)
+
     from ingestion.pipeline import run_ingestion
-    from ingestion.pipeline_types import JobRef, JobStatus
     from ingestion.queue import repository as job_repo
 
-    logger.info("%d page(s) queued from %s -- ingesting each now", len(job_ids), url)
-
-    for job_id in job_ids:
+    for row in job_rows:
+        job = JobRef(
+            job_id=row.job_id,
+            source_id=row.source_id,
+            version_id=row.version_id,
+            job_type=JobType(row.job_type),
+            status=JobStatus(row.status),
+            triggered_by=row.triggered_by,
+        )
         async with session_factory() as session:
-            job_row = await session.get(KnowledgeInjectionJob, job_id)
-            job = JobRef(
-                job_id=job_row.job_id,
-                source_id=job_row.source_id,
-                version_id=job_row.version_id,
-                job_type=JobType(job_row.job_type),
-                status=JobStatus(job_row.status),
-                triggered_by=job_row.triggered_by,
-            )
             try:
                 outcome = await run_ingestion(session, job)
             except Exception as exc:  # noqa: BLE001
-                logger.exception("ingestion crashed for job %s", job_id)
+                logger.exception("ingestion crashed for job %s", job.job_id)
                 await job_repo.complete_job(
                     session,
                     job_id=job.job_id,
@@ -262,12 +111,12 @@ async def crawl_and_ingest(
                     error_details=f"unhandled_exception: {exc}",
                 )
                 continue
+            logger.info(
+                "ingestion %s for job %s: chunks=%d entities=%d %s",
+                outcome.status.value, job.job_id, outcome.chunks_created_count,
+                outcome.entities_created_count, outcome.error_details or "",
+            )
 
-        logger.info(
-            "ingestion %s for job %s: chunks=%d entities=%d %s",
-            outcome.status.value, job_id, outcome.chunks_created_count,
-            outcome.entities_created_count, outcome.error_details or "",
-        )
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -279,11 +128,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _async_database_url() -> str:
-    """TODO: confirm the real async driver name -- guessing
-    `psycopg_async` here (SQLAlchemy's asyncio dialect for psycopg3).
-    If your driver is actually asyncpg instead, this needs to produce
-    `postgresql+asyncpg://` and you'd need the `asyncpg` package installed."""
-    from db.session import database_url  # read-only import, not modified
+    from db.session import database_url
 
     sync_url = database_url()
     return sync_url.replace("postgresql+psycopg://", "postgresql+psycopg_async://")

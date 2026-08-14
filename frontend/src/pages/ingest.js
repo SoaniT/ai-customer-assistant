@@ -38,10 +38,14 @@
 
       '  <div class="ingest-card">' +
       '    <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 0 20 15 15 0 0 1 0-20Z"/></svg> Crawl URL</h3>' +
-      '    <p class="desc">Extract knowledge from a public webpage, PDF or Office document and ingest it.</p>' +
+      '    <p class="desc">Extract knowledge from a public webpage, PDF or Office document — or crawl the whole website.</p>' +
       '    <div class="crawl-input-row">' +
-      '      <input type="text" id="crawlUrl" placeholder="https://example.com/page">' +
+      '      <input type="text" id="crawlUrl" placeholder="https://example.com">' +
       '      <button id="btnCrawl" class="btn btn-primary">Start Crawl</button>' +
+      '    </div>' +
+      '    <div class="seg" id="crawlMode">' +
+      '      <button type="button" class="seg-btn active" data-mode="page">Webpage</button>' +
+      '      <button type="button" class="seg-btn" data-mode="site">Website</button>' +
       '    </div>' +
       '    <div class="crawl-status" id="crawlStatus">' +
       '      <div class="label" id="crawlLabel">' +
@@ -65,6 +69,7 @@
     roots.btnCrawl = wrap.querySelector('#btnCrawl');
     roots.result = wrap.querySelector('#result');
     roots.selectedFile = null;
+    roots.crawlMode = 'page';
 
     roots.dropzone.addEventListener('click', function () { roots.fileInput.click(); });
     roots.dropzone.addEventListener('dragover', function (e) { e.preventDefault(); roots.dropzone.classList.add('drag'); });
@@ -79,6 +84,14 @@
     });
     roots.btnUpload.addEventListener('click', uploadFile);
     roots.btnCrawl.addEventListener('click', crawlUrl);
+
+    Array.prototype.forEach.call(wrap.querySelectorAll('#crawlMode .seg-btn'), function (b) {
+      b.addEventListener('click', function () {
+        Array.prototype.forEach.call(wrap.querySelectorAll('#crawlMode .seg-btn'), function (x) { x.classList.remove('active'); });
+        b.classList.add('active');
+        roots.crawlMode = b.getAttribute('data-mode');
+      });
+    });
   }
 
   function destroy() { roots = {}; }
@@ -131,6 +144,9 @@
       html = '<div class="result-ok"><b>Submitted for ingestion.</b></div>' +
         '<div class="hint">Still processing in the background (embeddings + graph extraction). Check the admin tab or retry in a moment.</div>' +
         '<div class="result-actions"><button class="btn btn-ghost btn-sm" data-copy="job_id">Copy job id</button></div>';
+    } else if (data.status === 'submitted' && data.job_ids && data.job_ids.length) {
+      html = '<div class="result-ok"><b>Site crawl submitted.</b></div>' +
+        '<div class="hint">' + NS.utils.esc(String(data.pages || data.job_ids.length)) + ' pages queued for ingestion in the background. Track progress in the admin tab.</div>';
     } else if (data.status === 'submitted') {
       html = '<div class="result-ok"><b>Submitted for ingestion.</b></div>' +
         '<pre class="code">' + NS.utils.esc(JSON.stringify({
@@ -142,6 +158,9 @@
         '<div class="result-actions"><button class="btn btn-ghost btn-sm" data-copy="job_id">Copy job id</button>' +
         '<button class="btn btn-ghost btn-sm" data-copy="source_id">Copy source id</button>' +
         '<button class="btn btn-ghost btn-sm" data-copy="version_id">Copy version id</button></div>';
+    } else if (data.status === 'error') {
+      html = '<div class="result-err"><b>Failed.</b></div>' +
+        '<div class="hint">' + NS.utils.esc(String(data.error || 'Unknown error.')) + '</div>';
     } else {
       html = '<pre class="code">' + NS.utils.esc(JSON.stringify(data, null, 2)) + '</pre>';
     }
@@ -224,6 +243,13 @@
         setBusy(false, roots.btnCrawl);
         return;
       }
+      if (data.job_ids && data.job_ids.length) {
+        renderResult(data);
+        showCrawlLabel(String(data.pages || data.job_ids.length) + ' pages submitted — ingesting in background…', false);
+        NS.utils.status('Site crawl submitted.');
+        setBusy(false, roots.btnCrawl);
+        return;
+      }
       showCrawlLabel('Submitted — ingesting in background…', false);
       pollJob(data.job_id, function (result) {
         setBusy(false, roots.btnCrawl);
@@ -283,8 +309,9 @@
   function crawlUrl() {
     var url = roots.crawlUrl.value.trim();
     if (!/^https?:\/\/.+/i.test(url)) { NS.utils.status('Enter a valid http(s) URL.', true); return; }
+    var site = roots.crawlMode === 'site';
     handleSubmit(url, function () {
-      return NS.api.post('/ingest/crawl', { url: url }, { timeout: 180000 });
+      return NS.api.post('/ingest/crawl', { url: url, site: site }, { timeout: site ? 600000 : 180000 });
     });
   }
 
