@@ -59,3 +59,23 @@ class NoFactFound(BaseModel):
     """The agent calls this when a chunk contains no extractable fact."""
 
     reason: str = "no concrete entity/fact found in this chunk"
+
+
+class ExtractionDocument(BaseModel):
+    """
+    The single JSON object the model emits per chunk under JSON mode
+    (gpt-oss models on Groq support JSON output but not parallel tool
+    calls). Each list uses the same field shapes as the tool args, so the
+    downstream mapping (tools.document_to_extraction) can reuse the exact
+    validation and canonicalization logic.
+    """
+
+    entities: list[ResolveEntityArgs] = Field(
+        default_factory=list, description="Resolved entities mentioned in the chunk."
+    )
+    attributes: list[RecordAttributeValueArgs] = Field(
+        default_factory=list, description="Attribute values stated about entities."
+    )
+    relations: list[RecordRelationArgs] = Field(
+        default_factory=list, description="Relationships between entities in the chunk."
+    )

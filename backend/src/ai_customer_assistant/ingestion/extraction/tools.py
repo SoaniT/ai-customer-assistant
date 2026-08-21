@@ -22,6 +22,7 @@ from ingestion.extraction.ontology import (
     safe_canonicalize_relation_type,
 )
 from ingestion.extraction.schema import (
+    ExtractionDocument,
     NoFactFound,
     RecordAttributeValueArgs,
     RecordRelationArgs,
@@ -150,4 +151,22 @@ def tool_calls_to_extraction(chunk_index: int, tool_calls: list[dict]) -> ChunkE
         tool_calls,
         ChunkExtraction(chunk_index=chunk_index, entity=None),
     )
+
+
+def document_to_extraction(chunk_index: int, doc: ExtractionDocument) -> ChunkExtraction:
+    """
+    Pure: map a validated JSON-mode ExtractionDocument onto a ChunkExtraction,
+    reusing the same canonicalization as the tool-call path. The primary
+    entity is the first entry in `doc.entities` (the prompt asks the model to
+    list the primary entity first).
+    """
+    acc = ChunkExtraction(chunk_index=chunk_index, entity=None)
+    for entity in doc.entities:
+        if acc.entity is None:
+            acc = _apply_resolve_entity(acc, entity)
+    for attribute in doc.attributes:
+        acc = _apply_attribute_value(acc, attribute)
+    for relation in doc.relations:
+        acc = _apply_relation(acc, relation)
+    return acc
 

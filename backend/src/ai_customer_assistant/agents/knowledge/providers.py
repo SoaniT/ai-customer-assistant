@@ -26,9 +26,29 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Callable, Optional, Protocol, TypeAlias
 
 from .config import KnowledgeAgentConfig
+
+# Rate-limit retry bound. 429s carry a `retry-after`; only short ones (burst
+# limits, e.g. TPM/RPM) are worth waiting for. A long retry-after means a
+# daily token budget is exhausted — retrying would burn budget for nothing,
+# so raise and let the caller degrade gracefully instead.
+_MAX_RATE_LIMIT_WAIT_S: float = 5.0
+
+
+def _retry_after_seconds(exc: Exception) -> Optional[float]:
+    """The ``Retry-After`` header Groq sets on 429s (seconds), or None."""
+    response = getattr(exc, "response", None)
+    header = getattr(response, "headers", None)
+    raw = header.get("retry-after") if header is not None else None
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 class KnowledgeProvider(Protocol):
@@ -147,10 +167,11 @@ class AnthropicKnowledgeProvider:
 
 
 class GroqKnowledgeProvider:
-    """Groq-backed provider (``openai/gpt-oss-120b`` default), mirroring
-    the Supervisor's Groq client."""
+    """Groq-backed provider (``openai/gpt-oss-20b`` default), mirroring
+    the Supervisor's Groq client. gpt-oss-20b has its own Groq TPD budget
+    (gpt-oss-120b shares one and exhausts under sustained use)."""
 
-    _DEFAULT_MODEL = "openai/gpt-oss-120b"
+    _DEFAULT_MODEL = "openai/gpt-oss-20b"
 
     def __init__(
         self,
@@ -158,6 +179,7 @@ class GroqKnowledgeProvider:
         model: str = _DEFAULT_MODEL,
         rewrite_model: str = _DEFAULT_MODEL,
         timeout: float = 15.0,
+        max_tokens: int = 1024,
     ) -> None:
         import groq
 
@@ -169,6 +191,12 @@ class GroqKnowledgeProvider:
         self.model = model
         self.rewrite_model = rewrite_model
         self.timeout = timeout
+        self._max_output_tokens: int = max_tokens
+        self._max_parse_retries: int = 3
+        self._bad_request_error: type[Exception] = groq.BadRequestError
+        self._api_connection_error: type[Exception] = groq.APIConnectionError
+        self._api_timeout_error: type[Exception] = groq.APITimeoutError
+        self._rate_limit_error: type[Exception] = groq.RateLimitError
 
     def rewrite_complete(self, prompt: str) -> str:
         return self._complete([{"role": "user", "content": prompt}], model=self.rewrite_model)
@@ -186,14 +214,53 @@ class GroqKnowledgeProvider:
         )
 
     def _complete(self, messages: list[dict], *, model: str) -> str:
-        response = self.client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0,
-            timeout=self.timeout,
-            response_format={"type": "json_object"},
-        )
-        return response.choices[0].message.content or "{}"
+        last_error: Exception | None = None
+        for attempt in range(self._max_parse_retries):
+            try:
+                # No `response_format`: gpt-oss-120b on Groq emits output
+                # Groq's JSON-mode parser rejects (`output_parse_failed`)
+                # on longer prompts (growing conversation history / long
+                # documentation). In free-form mode it produces clean,
+                # parseable JSON matching each prompt's explicit output
+                # format; the stage parsers strip code fences defensively.
+                response = self.client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0,
+                    timeout=self.timeout,
+                    max_tokens=self._max_output_tokens,
+                    reasoning_effort="low",
+                )
+                return response.choices[0].message.content or "{}"
+            except Exception as exc:  # noqa: BLE001 - see below
+                # The parse-failure 400, transient transport errors, and
+                # short-wait rate limits are stochastic; a bounded retry turns
+                # a ~50% failure rate into a few-percent one. Anything else
+                # (auth, an exhausted daily token budget, genuine bad request)
+                # is re-raised immediately: retrying would waste the attempt
+                # and could mask real provider errors.
+                if not self._is_retryable(exc) or attempt == self._max_parse_retries - 1:
+                    raise
+                last_error = exc
+                time.sleep(self._sleep_before_retry(exc, attempt))
+        raise last_error  # type: ignore[misc] - only reachable after a retryable error
+
+    def _is_retryable(self, exc: Exception) -> bool:
+        if isinstance(exc, (self._api_connection_error, self._api_timeout_error)):
+            return True
+        if isinstance(exc, self._rate_limit_error):
+            retry_after = _retry_after_seconds(exc)
+            return retry_after is None or retry_after <= _MAX_RATE_LIMIT_WAIT_S
+        if isinstance(exc, self._bad_request_error):
+            return "output_parse_failed" in str(getattr(exc, "body", None) or "")
+        return False
+
+    def _sleep_before_retry(self, exc: Exception, attempt: int) -> float:
+        if isinstance(exc, self._rate_limit_error):
+            retry_after = _retry_after_seconds(exc)
+            if retry_after is not None and retry_after <= _MAX_RATE_LIMIT_WAIT_S:
+                return max(retry_after, 0.5 * (attempt + 1))
+        return 0.5 * (attempt + 1)
 
 
 # ---------------------------------------------------------------------------

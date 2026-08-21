@@ -20,6 +20,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 
 from agents.safety_agent.types import GroundednessResult
+from agents.supervisor import agents_wiring
 from agents.supervisor.agents_wiring import (
     make_knowledge_agent_node,
     make_safety_gate_node,
@@ -109,6 +110,23 @@ def test_knowledge_node_empty_history_maps_to_empty_tuple():
 
     asyncio.run(node(_state()))
     assert fake.calls[0]["conversation_history"] == ()
+
+
+def test_knowledge_node_caps_history_to_last_max_turns():
+    fake = FakeKnowledgeGraph(result={"response": FakeResponse("answer", True)})
+    node = make_knowledge_agent_node(fake)
+
+    many = [
+        ConversationTurn(role="user", content=f"turn-{i}")
+        for i in range(20)
+    ]
+    asyncio.run(node(_state(conversation_history=many)))
+    forwarded = fake.calls[0]["conversation_history"]
+    # Only the last _KNOWLEDGE_MAX_HISTORY_TURNS turns survive, oldest dropped.
+    assert len(forwarded) == agents_wiring._KNOWLEDGE_MAX_HISTORY_TURNS
+    assert "turn-0" not in forwarded
+    assert forwarded[0] == "User: turn-14"
+    assert forwarded[-1] == "User: turn-19"
 
 
 def test_knowledge_node_preserves_citations():

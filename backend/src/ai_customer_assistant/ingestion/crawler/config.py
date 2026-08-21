@@ -14,7 +14,7 @@ _VALID_WAIT_STRATEGIES = ("fixed_timeout", "networkidle", "selector")
 class CrawlConfig:
     mode: CrawlMode = CrawlMode.PAGE
     max_depth: int = 2
-    max_pages: int = 50
+    max_pages: int = 10
     request_timeout: float = 15.0
     concurrent_requests: int = 5
     retry_count: int = 2

@@ -19,10 +19,17 @@ return a full state object (via `dataclasses.replace`), LangGraph
 raises `InvalidUpdateError` — even for fields neither node changed,
 because a full-object return still counts as a write to every field on
 it. Returning only the changed field(s) as a dict means the two
-parallel branches write to disjoint channels (`structured_facts` vs
-`retrieved_chunks`) and merge cleanly. This is why every node function
-below returns `{"field_name": value}` rather than a `KnowledgeAgentState`
-instance, and why `Node`'s return type is `Awaitable[dict]`, not
+parallel branches mostly write to disjoint channels (`structured_facts`
+vs `retrieved_chunks`) and merge cleanly. `structured_facts` is the one
+deliberate exception: it is an `Annotated` reducer channel (state.py),
+so the fan-out merges cleanly even when BOTH branches write it —
+`structured_lookup` with its EAV facts and `vector_search` with the
+entity-name-fallback facts it emits when vector retrieval comes back
+empty (this was a real `InvalidUpdateError` before the reducer: any
+second writer in the same step, even writing an empty tuple, crashed
+the graph). This is why every node function below returns
+`{"field_name": value}` rather than a `KnowledgeAgentState` instance,
+and why `Node`'s return type is `Awaitable[dict]`, not
 `Awaitable[KnowledgeAgentState]`.
 
 Dependency injection pattern: each node needs collaborators (config,
@@ -87,7 +94,14 @@ from .ranking import rank_results
 from .rewriting import LLMCompletion as RewriteLLMCompletion
 from .rewriting import rewrite_query
 from .state import KnowledgeAgentState
-from .structured_lookup import structured_lookup
+from .structured_lookup import (
+    entity_name_fallback,
+    looks_like_member_roster_question,
+    looks_like_source_inventory_question,
+    member_roster_fallback,
+    source_inventory_fallback,
+    structured_lookup,
+)
 from .types import RankedResult
 from .vector_search import EmbeddingFunction, vector_search
 
@@ -160,6 +174,30 @@ def make_structured_lookup_node(*, session_factory: async_sessionmaker[AsyncSess
                 facts = await structured_lookup(state.structured_query, session=session)
             except GRACEFUL_STRUCTURED_MISSES:
                 facts = ()
+            query_text = getattr(state.rewritten_query, "rewritten_text", "") or ""
+            if (
+                not facts
+                or looks_like_member_roster_question(query_text)
+                or looks_like_source_inventory_question(query_text)
+            ):
+                # The EAV lookup came up empty, or the query is
+                # intent-flavored (roster / source-inventory) even though
+                # extraction resolved a generic entity. A roster question
+                # rewritten to "who are the members of Alpinist Studios?"
+                # often lands on a *general* EAV lookup that returns the
+                # company's attribute facts — non-empty, so a strict
+                # empty-only fallback would skip the roster entirely and
+                # the answer would starve. Run the deterministic fallbacks
+                # and merge, roster facts FIRST — every fallback fact
+                # carries confidence 1.0 so ranking preserves insertion
+                # order and the context budget keeps the intent-specific
+                # facts. In hybrid mode the vector branch may emit the same
+                # facts, which the reducer channel merges and deduplicate()
+                # drops.
+                roster = await member_roster_fallback(query_text, session=session)
+                named = await entity_name_fallback(query_text, session=session)
+                inventory = await source_inventory_fallback(query_text, session=session)
+                facts = (*roster, *named, *inventory, *facts)
         return {"structured_facts": facts}
 
     return _structured_lookup_node
@@ -179,7 +217,27 @@ def make_vector_search_node(
                 chunks = await vector_search(state.rewritten_query, config=config, session=session, embed_query=embed_query)
             except GRACEFUL_VECTOR_MISSES:
                 chunks = ()
-        return {"retrieved_chunks": chunks}
+            facts: tuple = ()
+            if not chunks:
+                # Nothing vector-matched. Before giving up, try the
+                # deterministic name fallback: questions that name a known
+                # entity ("is Katherine Mah an advisor?") often vector-miss
+                # the declarative chunk text while the EAV graph has the
+                # answer; source-inventory questions ("how many links have
+                # I ingested?") vector-miss entirely and the count lives in
+                # knowledge_source; roster questions ("who are the
+                # members?") vector-miss the team list which lives in the
+                # Person entities. All three fallbacks run and merge (see
+                # the structured node for why not first-non-empty-wins),
+                # roster facts first so the intent-specific facts survive
+                # the context budget. Merged facts travel alongside the
+                # (empty) chunks.
+                query_text = getattr(state.rewritten_query, "rewritten_text", "") or ""
+                roster = await member_roster_fallback(query_text, session=session)
+                named = await entity_name_fallback(query_text, session=session)
+                inventory = await source_inventory_fallback(query_text, session=session)
+                facts = (*roster, *named, *inventory)
+        return {"retrieved_chunks": chunks, "structured_facts": facts}
 
     return _vector_search_node
 

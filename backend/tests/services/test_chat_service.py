@@ -108,3 +108,86 @@ async def test_thread_ids_are_isolated():
     assert (snapshot_a.values.get("conversation_history") or []) != (
         snapshot_b.values.get("conversation_history") or []
     )
+
+
+class _EscalationResponse:
+    def __init__(self, answer_text: str, is_grounded: bool) -> None:
+        self.answer_text = answer_text
+        self.is_grounded = is_grounded
+        self.citations = []
+
+
+class _EscalationKnowledgeGraph:
+    """Fake Knowledge subgraph: grounded for everything except queries named
+    in ``ungrounded_on``, which return an ungrounded (empty) answer so the
+    Safety gate pauses for escalation confirmation."""
+
+    def __init__(self, ungrounded_on: set[str]) -> None:
+        self.ungrounded_on = ungrounded_on
+        self.calls: list[str] = []
+
+    async def ainvoke(self, state: dict) -> dict:
+        q = state["raw_query"]
+        self.calls.append(q)
+        if q in self.ungrounded_on:
+            return {"response": _EscalationResponse("", False)}
+        return {"response": _EscalationResponse(f"answer to {q}", True)}
+
+
+@pytest.mark.asyncio
+async def test_new_question_after_escalation_is_not_consumed_as_resume():
+    """Regression test for the escalation-interrupt leak: when the Safety
+    gate paused asking whether to escalate, a NEW question used to be
+    consumed as the resume value (declining the escalation) and the stale
+    fallback for the OLD question was echoed back. A new question must
+    instead decline the pending escalation and then run as a fresh turn."""
+    from langgraph.checkpoint.memory import MemorySaver
+    from agents.supervisor.graph import build_supervisor_graph
+    from services.chat_service import ChatService
+
+    client = _KnowledgeQueryClient()
+    fake = _EscalationKnowledgeGraph(
+        ungrounded_on={"how many team members do you have"}
+    )
+    svc = ChatService(
+        graph=build_supervisor_graph(
+            llm_client=client,
+            knowledge_graph=fake,
+            checkpointer=MemorySaver(),
+        ),
+        llm_client=client,
+    )
+
+    grounded = await svc.handle_message("t-esc", "who is the ceo")
+    assert grounded == "answer to who is the ceo"
+
+    escalation = await svc.handle_message("t-esc", "how many team members do you have")
+    assert "escalate" in escalation.lower() or "support" in escalation.lower()
+
+    fresh = await svc.handle_message("t-esc", "what services do you offer")
+    assert "team members" not in fresh.lower()
+    assert fresh == "answer to what services do you offer"
+
+    # The graph really ran the new message as a fresh turn (not the stale
+    # fallback for the old query being echoed back).
+    assert fake.calls[-1] == "what services do you offer"
+
+
+@pytest.mark.asyncio
+async def test_affirmative_resume_after_escalation_goes_to_ticket():
+    """An explicit 'yes' to the escalation confirmation resumes the graph
+    with a confirmation (True-ish), NOT a fresh turn — the escalation path
+    proceeds to the ticket agent (which pauses for an email)."""
+    svc = await build_chat_service(
+        llm_client=_KnowledgeQueryClient(),
+        knowledge_graph=_EscalationKnowledgeGraph(
+            ungrounded_on={"how many team members do you have"}
+        ),
+    )
+
+    await svc.handle_message("t-aff", "who is the ceo")
+    escalation = await svc.handle_message("t-aff", "how many team members do you have")
+    assert "escalate" in escalation.lower() or "support" in escalation.lower()
+
+    email_q = await svc.handle_message("t-aff", "yes")
+    assert "email" in email_q.lower()

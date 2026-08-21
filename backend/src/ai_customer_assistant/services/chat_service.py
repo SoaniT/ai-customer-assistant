@@ -29,6 +29,14 @@ confirmation) are surfaced transparently:
 - When the current turn pauses, ``handle_message`` returns the question
   the assistant needs answered, and the thread stays open in the
   checkpointer for the follow-up.
+
+One asymmetry is handled explicitly: the Safety gate's escalation
+confirmation pauses at the ``safety_gate`` node. Users don't always answer
+"yes/no" — they often just ask the *next* question. A pending escalation is
+therefore only resumed when the new message is an affirmative confirmation;
+anything else (a new question, or an explicit decline) first resumes the
+gate with ``False`` to safely decline the escalation, then re-processes the
+new message as a fresh turn so it is never consumed as the resume value.
 """
 from __future__ import annotations
 
@@ -41,7 +49,8 @@ from agents.contracts import ConversationTurn
 from agents.knowledge.config import KnowledgeAgentConfig
 from agents.knowledge.graph import build_knowledge_agent_graph
 from agents.knowledge.providers import build_knowledge_provider, llm_completions
-from agents.supervisor.graph import build_supervisor_graph
+from agents.supervisor.agents_wiring import _confirms_escalation
+from agents.supervisor.graph import build_supervisor_graph, SAFETY_GATE_NODE
 from agents.supervisor.llm_client import SupervisorLLMClient, build_llm_client
 from agents.ticket_agent.store import TicketStore
 from db.checkpointer import build_checkpointer
@@ -122,11 +131,30 @@ class ChatService:
         history = list(snapshot.values.get("conversation_history") or [])
 
         if snapshot.next:
-            # A previous turn paused waiting for the user (email collection
-            # or escalation confirmation): this message is the resume value.
-            result = await self.graph.ainvoke(
-                Command(resume=user_message), config=config
-            )
+            # A previous turn paused waiting for the user. The escalation
+            # confirmation (Safety gate) is only resumed by an affirmative;
+            # a new question or explicit decline safely declines it first,
+            # then runs the new message as a fresh turn so it isn't consumed
+            # as the resume value (which previously echoed the stale answer).
+            pending_nodes = set(snapshot.next)
+            if (
+                SAFETY_GATE_NODE in pending_nodes
+                and not _confirms_escalation(user_message)
+            ):
+                await self.graph.ainvoke(
+                    Command(resume=False), config=config
+                )
+                result = await self.graph.ainvoke(
+                    {
+                        "user_message": user_message,
+                        "conversation_history": history,
+                    },
+                    config=config,
+                )
+            else:
+                result = await self.graph.ainvoke(
+                    Command(resume=user_message), config=config
+                )
         else:
             result = await self.graph.ainvoke(
                 {

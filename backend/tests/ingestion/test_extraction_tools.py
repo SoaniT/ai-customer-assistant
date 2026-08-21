@@ -8,7 +8,8 @@ using class names here silently fails (they hit the "unknown tool" fallback,
 same as an actually-unrecognized name from the model).
 """
 
-from ingestion.extraction.tools import tool_calls_to_extraction
+from ingestion.extraction.schema import ExtractionDocument
+from ingestion.extraction.tools import document_to_extraction, tool_calls_to_extraction
 
 
 def test_no_fact_found_yields_empty_extraction():
@@ -60,4 +61,62 @@ def test_resolve_entity_then_attribute_and_relation():
 
 def test_unknown_tool_name_is_ignored_not_raised():
     result = tool_calls_to_extraction(0, [{"name": "SomethingElse", "args": {}}])
+    assert result.entity is None
+
+
+def test_empty_document_yields_empty_extraction():
+    result = document_to_extraction(0, ExtractionDocument())
+    assert result.entity is None
+    assert result.facts == ()
+    assert result.relations == ()
+
+
+def test_document_maps_entities_attributes_relations():
+    doc = ExtractionDocument.model_validate(
+        {
+            "entities": [
+                {"entity_type": "customer", "name": "Acme Co", "label": "Acme Co"},
+                {"entity_type": "product", "name": "Alpinist Suite", "label": "Alpinist Suite"},
+            ],
+            "attributes": [
+                {
+                    "entity_type": "customer",
+                    "entity_name": "Acme Co",
+                    "namespace": "customer",
+                    "attribute_name": "plan_tier",
+                    "value": "enterprise",
+                }
+            ],
+            "relations": [
+                {
+                    "source_entity_type": "customer",
+                    "source_entity_name": "Acme Co",
+                    "target_entity_type": "product",
+                    "target_entity_name": "Alpinist Suite",
+                    "relation_type": "uses",
+                }
+            ],
+        }
+    )
+
+    result = document_to_extraction(2, doc)
+
+    assert result.chunk_index == 2
+    assert result.entity == ("customer", "Acme Co")
+    assert len(result.facts) == 1
+    assert result.facts[0].attribute_name == "plan_tier"
+    assert len(result.relations) == 1
+    assert result.relations[0].relation_type == "uses"
+
+
+def test_document_unknown_extra_fields_are_ignored():
+    doc = ExtractionDocument.model_validate(
+        {
+            "entities": [],
+            "attributes": [],
+            "relations": [],
+            "summary": "gpt-oss may add extra keys",
+        }
+    )
+    result = document_to_extraction(0, doc)
     assert result.entity is None

@@ -25,6 +25,7 @@ from .constants import (
     DEFAULT_GROUNDEDNESS_THRESHOLD,
     DEFAULT_MAX_CONTEXT_CHUNKS,
     DEFAULT_MAX_STRUCTURED_FACTS,
+    DEFAULT_RELAXED_SIMILARITY_THRESHOLD,
     DEFAULT_SIMILARITY_THRESHOLD,
     DEFAULT_TOP_K,
 )
@@ -47,6 +48,10 @@ class KnowledgeAgentConfig(BaseSettings):
     # -- Vector search -----------------------------------------------------
     top_k: int = DEFAULT_TOP_K
     similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD
+    # Second-pass threshold applied only when the primary pass returns
+    # nothing: recovers semantically-adjacent chunks (e.g. count-style
+    # queries) without lowering precision for queries that do match.
+    relaxed_similarity_threshold: float = DEFAULT_RELAXED_SIMILARITY_THRESHOLD
     embedding_model_name: str = DEFAULT_EMBEDDING_MODEL_NAME
     embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION
 
@@ -82,6 +87,7 @@ class KnowledgeAgentConfig(BaseSettings):
 
     @field_validator(
         "similarity_threshold",
+        "relaxed_similarity_threshold",
         "extraction_confidence_threshold",
         "groundedness_threshold",
     )
@@ -90,6 +96,16 @@ class KnowledgeAgentConfig(BaseSettings):
         if not 0.0 <= value <= 1.0:
             raise ValueError("must be between 0.0 and 1.0 inclusive")
         return value
+
+    @model_validator(mode="after")
+    def _relaxed_threshold_must_not_exceed_primary(self) -> "KnowledgeAgentConfig":
+        if self.relaxed_similarity_threshold > self.similarity_threshold:
+            raise ValueError(
+                "relaxed_similarity_threshold must not exceed similarity_threshold "
+                f"(relaxed={self.relaxed_similarity_threshold}, "
+                f"primary={self.similarity_threshold})"
+            )
+        return self
 
     @model_validator(mode="after")
     def _top_k_fits_within_context_budget(self) -> "KnowledgeAgentConfig":

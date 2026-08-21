@@ -39,6 +39,7 @@ from ingestion.crawler.config import CrawlConfig, CrawlMode
 from ingestion.crawler.models import DiscoveryResult
 from ingestion.pipeline_types import FileType, JobType, JobRef, JobStatus
 from ingestion.queue.document_producer import register_document_version
+from ingestion.queue import repository as job_repo
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
@@ -178,6 +179,19 @@ async def _register_and_run(
     )
     if job is None:
         return {"status": "duplicate_skipped"}
+    # Claim the job the same way the worker's claim_next_job does, BEFORE
+    # running it in-process -- otherwise the worker would also pick up this
+    # QUEUED job and the same version would be ingested twice (double-writing
+    # chunks and failing persistence with MultipleResultsFound).
+    claimed = await job_repo.claim_job(session, job.job_id)
+    if claimed is None:
+        # The worker already claimed it in the meantime -- nothing to do.
+        return {
+            "status": "submitted",
+            "job_id": str(job.job_id),
+            "source_id": str(job.source_id),
+            "version_id": str(job.version_id),
+        }
     asyncio.create_task(_run_job(job.job_id))
     return {
         "status": "submitted",

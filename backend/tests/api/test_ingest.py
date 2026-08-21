@@ -148,8 +148,20 @@ async def test_crawl_page_roundtrip_job_status_transitions(ingest, monkeypatch):
         job.chunks_created_count = 2
         job.entities_created_count = 1
 
+    async def _fake_claim_job(session, job_id_):
+        job.status = "RUNNING"
+        return SimpleNamespace(
+            job_id=job_id_,
+            source_id=uuid.uuid4(),
+            version_id=uuid.uuid4(),
+            job_type="INITIAL_INGEST",
+            status="RUNNING",
+            triggered_by="system:crawler",
+        )
+
     monkeypatch.setattr(ingest.httpx, "AsyncClient", _FakeClient)
     monkeypatch.setattr(ingest, "register_document_version", _fake_register)
+    monkeypatch.setattr(ingest.job_repo, "claim_job", _fake_claim_job)
     monkeypatch.setattr(ingest, "_run_job", _fake_run_job)
 
     async with AsyncClient(

@@ -17,6 +17,7 @@ the Supervisor graph.
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any, Callable, Mapping, Optional
 
 from langgraph.config import get_config
@@ -31,10 +32,20 @@ from ..safety_agent.types import GroundednessResult
 
 KnowledgeGraph = Callable[[Mapping[str, Any]], Any]
 
+# Cap on the conversation history forwarded to the Knowledge agent.
+# Every turn is rendered into BOTH the rewrite prompt and the answer prompt,
+# so an unbounded history makes the answer generation slower and slower —
+# measured 2.6s -> 22s over 4 turns on gpt-oss-120b, blowing past the
+# frontend's 15s timeout. Bounding the history keeps prompts (and latency)
+# roughly constant. Mirrors the Supervisor classifier's own history cap.
+_KNOWLEDGE_MAX_HISTORY_TURNS: int = 6
+
+_DEFAULT_KNOWLEDGE_TIMEOUT_S: float = 60.0
+
 
 def make_knowledge_agent_node(
     knowledge_graph: KnowledgeGraph,
-    timeout_s: float = 30,
+    timeout_s: Optional[float] = None,
 ) -> Callable[[SupervisorState], Any]:
     """Build the Knowledge Agent adapter node.
 
@@ -44,27 +55,37 @@ def make_knowledge_agent_node(
       - (via ``flatten_history``), matching Knowledge's
       - ``conversation_history: tuple[str, ...]`` channel.
 
+    The conversation history is capped at ``_KNOWLEDGE_MAX_HISTORY_TURNS``
+    turns (last N only) so the Knowledge rewrite/answer prompts stay bounded
+    in size as a thread grows.
+
     Runs ``knowledge_graph.ainvoke(...)`` under
-    ``asyncio.wait_for(..., timeout_s)``. On timeout or any exception it
-    returns a GroundedResponse-shaped *error marker* (``error`` key set),
-    not a ``DownstreamResult`` — the Safety gate (Phase 2) is the single
-    place that constructs ``DownstreamStatus.ERROR`` from a failed
-    retrieval.
+    ``asyncio.wait_for(..., timeout_s)``. ``timeout_s`` defaults to
+    ``KNOWLEDGE_AGENT_TIMEOUT_S`` env (60s) — the frontend chat client must
+    allow at least as long. On timeout or any exception it returns a
+    GroundedResponse-shaped *error marker* (``error`` key set), not a
+    ``DownstreamResult`` — the Safety gate (Phase 2) is the single place that
+    constructs ``DownstreamStatus.ERROR`` from a failed retrieval.
 
     Success returns only GroundedResponse fields under ``knowledge_response``:
     ``{"answer_text", "is_grounded", "citations"}``.
     """
+    resolved_timeout = timeout_s if timeout_s is not None else float(
+        os.environ.get("KNOWLEDGE_AGENT_TIMEOUT_S", _DEFAULT_KNOWLEDGE_TIMEOUT_S)
+    )
+
     async def knowledge_agent(state: SupervisorState) -> dict:
+        history = state.get("conversation_history", []) or []
         knowledge_input = {
             "raw_query": state["user_message"],
             "conversation_history": tuple(
-                flatten_history(state.get("conversation_history", []))
+                flatten_history(history[-_KNOWLEDGE_MAX_HISTORY_TURNS:])
             ),
         }
         try:
             result = await asyncio.wait_for(
                 knowledge_graph.ainvoke(knowledge_input),
-                timeout=timeout_s,
+                timeout=resolved_timeout,
             )
         except asyncio.TimeoutError:
             return _error_marker("timeout")

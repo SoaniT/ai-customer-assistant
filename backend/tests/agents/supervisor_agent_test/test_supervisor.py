@@ -20,7 +20,15 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from agents.supervisor.classification import parse_llm_response
 from agents.supervisor.graph import build_supervisor_graph
-from agents.supervisor.routing import decide_post_downstream, decide_route
+from agents.supervisor.prompt import (
+    DEFAULT_DOMAIN_DEFINITION,
+    build_supervisor_system_prompt,
+)
+from agents.supervisor.routing import (
+    _SAFE_FALLBACK_RESPONSE,
+    decide_post_downstream,
+    decide_route,
+)
 from agents.supervisor.schema import (
     Intent,
     NextAgent,
@@ -89,6 +97,39 @@ def test_parse_llm_response_clamps_out_of_range_confidence():
     result = parse_llm_response(raw)
     assert result.domain_confidence == 1.0
     assert result.intent_confidence == 0.0
+
+
+def test_parse_llm_response_strips_code_fence():
+    """Free-form model output is sometimes wrapped in a ```json fence;
+    the parser strips it before json.loads (mirrors the Knowledge
+    parsers' defensive _strip_code_fence)."""
+    payload = {
+        "request_category": "GREETING",
+        "domain_confidence": 1.0,
+        "intent": "UNKNOWN",
+        "intent_confidence": 0.0,
+        "clarification_question": None,
+    }
+    raw = "```json\n" + json.dumps(payload) + "\n```"
+    result = parse_llm_response(raw)
+    assert result.request_category is RequestCategory.GREETING
+    assert result.intent is Intent.UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# prompt.build_supervisor_system_prompt
+# ---------------------------------------------------------------------------
+
+def test_build_supervisor_system_prompt_renders_domain_definition():
+    prompt = build_supervisor_system_prompt()
+    assert "{DOMAIN_DEFINITION}" not in prompt
+    assert DEFAULT_DOMAIN_DEFINITION in prompt
+
+
+def test_build_supervisor_system_prompt_allows_override():
+    prompt = build_supervisor_system_prompt(domain_definition="ACME support KB")
+    assert "ACME support KB" in prompt
+    assert DEFAULT_DOMAIN_DEFINITION not in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +244,23 @@ def _run(payload: dict, attempts: int = 0) -> dict:
 def test_graph_greeting_end_to_end():
     result = _run({"request_category": "GREETING", "domain_confidence": 0.99, "intent": "UNKNOWN", "intent_confidence": 0.0, "clarification_question": None})
     assert result["final_response"] == "Hello! How can I help you today?"
+
+
+def test_graph_classifier_failure_degrades_to_safe_fallback():
+    """A provider error during classification (e.g. an exhausted rate limit)
+    must terminate the turn with the safe fallback response instead of
+    crashing the request into an HTTP 500."""
+
+    class _FailingClient:
+        def classify(self, system_prompt, user_message, conversation_history) -> str:
+            raise RuntimeError("groq rate limit")
+
+    graph = build_supervisor_graph(llm_client=_FailingClient())
+    result = graph.invoke(
+        {"user_message": "who is the ceo", "conversation_history": [], "clarification_attempts": 0}
+    )
+    assert result["final_response"] == _SAFE_FALLBACK_RESPONSE
+    assert result["next_agent"] == NextAgent.NONE
 
 
 def test_graph_unknown_exhausted_reaches_ticket_agent():

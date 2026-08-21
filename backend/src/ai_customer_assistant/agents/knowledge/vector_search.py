@@ -150,10 +150,18 @@ async def vector_search(
     active-source chunks, ranked by cosine similarity and truncated to
     `config.top_k`.
 
+    When the primary pass (``config.similarity_threshold``) returns
+    nothing, a second pass at ``config.relaxed_similarity_threshold`` is
+    attempted. That second pass recovers chunks that are semantically
+    adjacent but not close — e.g. count/aggregate queries ("how many
+    members...") whose embedding lands just below a strict match — while
+    keeping precision high for queries that do match. It only ever runs
+    after a primary miss, never in addition to it.
+
     Raises VectorSearchError if the embedding call fails or returns a
     vector of the wrong dimension. Raises EmptyRetrievalError if no
-    chunk clears `config.similarity_threshold` — this is a signal for
-    the caller (hybrid.py) to decide whether to fall back to a
+    chunk clears even the relaxed threshold — this is a signal for the
+    caller (hybrid.py) to decide whether to fall back to a
     structured-only strategy or treat it as ungrounded, not something
     this module decides on the caller's behalf."""
     query_vector = _embed_query_text(embed_query, rewritten.rewritten_text, config=config)
@@ -164,9 +172,19 @@ async def vector_search(
         similarity_threshold=config.similarity_threshold,
         top_k=config.top_k,
     )
+    if not ranked and config.relaxed_similarity_threshold < config.similarity_threshold:
+        ranked = _rank_by_similarity(
+            candidate_rows,
+            query_vector,
+            similarity_threshold=config.relaxed_similarity_threshold,
+            top_k=config.top_k,
+        )
     if not ranked:
         raise EmptyRetrievalError(
-            message=f"no chunk met similarity_threshold={config.similarity_threshold} for the rewritten query",
+            message=(
+                f"no chunk met similarity_threshold={config.similarity_threshold} "
+                f"(relaxed={config.relaxed_similarity_threshold}) for the rewritten query"
+            ),
             query_text=rewritten.rewritten_text,
             top_k=config.top_k,
         )

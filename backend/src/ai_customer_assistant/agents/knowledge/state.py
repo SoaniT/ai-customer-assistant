@@ -15,8 +15,12 @@ Field lifecycle across the graph (see graph.py for exact wiring):
     structured_query                     — set by the `extract` node
     retrieval_strategy                   — set by the `decide_strategy`
                                             conditional edge (hybrid.py)
-    structured_facts                     — set by `structured_lookup` node
-                                            (structured or hybrid path only)
+    structured_facts                     — written by `structured_lookup`
+                                            node (structured/hybrid path) and
+                                            possibly by `vector_search` node's
+                                            entity-name fallback (vector/hybrid
+                                            path); reducer-merged, so a hybrid
+                                            fan-out writing both never clashes
     retrieved_chunks                     — set by `vector_search` node
                                             (vector or hybrid path only)
     ranked_result                        — set by the `rank` node
@@ -29,7 +33,8 @@ Field lifecycle across the graph (see graph.py for exact wiring):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from operator import add
+from typing import Annotated, Optional
 
 from .types import (
     BuiltContext,
@@ -58,7 +63,7 @@ class KnowledgeAgentState:
     structured_query: Optional[StructuredQuery] = None
     retrieval_strategy: Optional[str] = None  # "structured" | "vector" | "hybrid"
 
-    structured_facts: tuple[StructuredFact, ...] = ()
+    structured_facts: Annotated[tuple[StructuredFact, ...], add] = ()
     retrieved_chunks: tuple[RetrievedChunk, ...] = ()
 
     ranked_result: Optional[RankedResult] = None

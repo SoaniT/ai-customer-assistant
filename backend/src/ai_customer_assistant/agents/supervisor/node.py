@@ -11,9 +11,27 @@ from typing import Callable
 
 from .classification import parse_llm_response
 from .llm_client import SupervisorLLMClient
-from .prompt import SUPERVISOR_SYSTEM_PROMPT
-from .routing import assemble_final_response, decide_route
-from .schema import SupervisorState
+from .prompt import build_supervisor_system_prompt
+from .routing import _SAFE_FALLBACK_RESPONSE, assemble_final_response, decide_route
+from .schema import Intent, NextAgent, RequestCategory, SupervisorState
+
+
+def _unavailable_decision() -> dict:
+    """Partial-state update for when classification is impossible (provider
+    error, exhausted rate limit, transient outage): terminate the turn with
+    the safe fallback instead of crashing the request into an HTTP 500."""
+    return {
+        "request_category": RequestCategory.OUT_OF_SCOPE.value,
+        "domain_confidence": 0.0,
+        "intent": Intent.UNKNOWN.value,
+        "intent_confidence": 0.0,
+        "clarification_required": False,
+        "clarification_question": None,
+        "clarification_attempts": 0,
+        "next_agent": NextAgent.NONE.value,
+        "ticket_type": None,
+        "final_response": _SAFE_FALLBACK_RESPONSE,
+    }
 
 
 def make_classify_and_route_node(
@@ -24,15 +42,22 @@ def make_classify_and_route_node(
     The returned function is what LangGraph invokes on entry: it reads
     user_message / conversation_history, classifies, decides where to route,
     and returns a partial update — never a mutated copy of the input state.
+
+    A classifier failure (provider error, rate limit, outage) degrades to the
+    safe-fallback decision rather than raising through the graph into the API
+    layer as an HTTP 500.
     """
 
     def classify_and_route(state: SupervisorState) -> dict:
-        raw_response = llm_client.classify(
-            system_prompt=SUPERVISOR_SYSTEM_PROMPT,
-            user_message=state["user_message"],
-            conversation_history=state.get("conversation_history", []),
-        )
-        classification = parse_llm_response(raw_response)
+        try:
+            raw_response = llm_client.classify(
+                system_prompt=build_supervisor_system_prompt(),
+                user_message=state["user_message"],
+                conversation_history=state.get("conversation_history", []),
+            )
+            classification = parse_llm_response(raw_response)
+        except Exception:
+            return _unavailable_decision()
         decision = decide_route(
             classification=classification,
             prior_attempts=state.get("clarification_attempts", 0),

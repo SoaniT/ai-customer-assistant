@@ -18,16 +18,27 @@ from schemas.chat import ChatRequest, ChatResponse
 
 router = APIRouter(tags=["chat"])
 
+# Last-line safety net: a chat turn must never surface as an HTTP 500 to the
+# customer. The graph and its nodes already degrade gracefully (classifier
+# failure, knowledge timeout, etc.), but any residual unexpected exception is
+# mapped to the safe fallback reply here.
+_SAFE_FALLBACK_REPLY = (
+    "Sorry, something went wrong on my end. Thank you for your patience, and please try again later."
+)
+
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
     service = request.app.state.chat_service
     trace_id = str(uuid.uuid4())
-    reply, citations = await service.handle_message_turn(
-        payload.thread_id,
-        payload.message,
-        trace_id=trace_id,
-    )
+    try:
+        reply, citations = await service.handle_message_turn(
+            payload.thread_id,
+            payload.message,
+            trace_id=trace_id,
+        )
+    except Exception:
+        reply, citations = _SAFE_FALLBACK_REPLY, []
     return ChatResponse(
         thread_id=payload.thread_id,
         reply=reply,

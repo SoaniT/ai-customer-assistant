@@ -1,14 +1,17 @@
 """
 EAV extraction agent (ingestion_flow.md step 5), implemented as a single
-LangChain tool-calling completion per chunk -- not a multi-turn agentic
-loop, since the task is structured extraction, not multi-step reasoning
-with external actions. Bounding it to one call keeps cost/latency
-predictable per chunk and keeps the whole thing a pure function of
-(model, chunk) modulo the network call itself.
+JSON-mode completion per chunk -- not a multi-turn agentic loop, since the
+task is structured extraction, not multi-step reasoning with external
+actions. We deliberately use JSON structured output rather than tool
+calling: the models served by Groq that best fit extraction (e.g.
+`openai/gpt-oss-120b`) support JSON mode but not parallel tool calls, and a
+single JSON object per chunk is a pure function of (model, chunk) modulo the
+network call itself.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -18,18 +21,16 @@ from ingestion.extraction.prompts import (
     CHUNK_TASK_TEMPLATE,
     SYSTEM_PROMPT,
 )
-from ingestion.extraction.tools import (
-    TOOL_DEFS,
-    tool_calls_to_extraction,
-)
+from ingestion.extraction.schema import ExtractionDocument
+from ingestion.extraction.tools import document_to_extraction
 from ingestion.pipeline_types import ChunkExtraction
 
 
-class ToolCallingChatModel(Protocol):
+class JsonModeChatModel(Protocol):
     """Structural type for whatever chat model the app configures (see
     supervisor_plan.md's 'select the LLM provider and model' requirement)."""
 
-    def bind_tools(self, tools: list[type]) -> "ToolCallingChatModel": ...
+    def bind(self, **kwargs) -> "JsonModeChatModel": ...
 
     def invoke(self, messages: list) -> object: ...  # returns an AIMessage
 
@@ -38,11 +39,13 @@ class ToolCallingChatModel(Protocol):
 class ExtractionAgent:
     """A bound, ready-to-invoke model. Immutable -- build once, reuse."""
 
-    model: ToolCallingChatModel
+    model: JsonModeChatModel
 
 
-def build_extraction_agent(llm: ToolCallingChatModel) -> ExtractionAgent:
-    return ExtractionAgent(model=llm.bind_tools(list(TOOL_DEFS)))
+def build_extraction_agent(llm: JsonModeChatModel) -> ExtractionAgent:
+    return ExtractionAgent(
+        model=llm.bind(response_format={"type": "json_object"})
+    )
 
 
 def _build_messages(*, source_name: str, chunk_index: int, chunk_text: str) -> list:
@@ -56,6 +59,16 @@ def _build_messages(*, source_name: str, chunk_index: int, chunk_text: str) -> l
             )
         ),
     ]
+
+
+def _parse_extraction(chunk_index: int, raw: str) -> ChunkExtraction:
+    """Parse the model's JSON into a ChunkExtraction. Malformed output maps
+    to an empty extraction rather than raising, so extraction stays total."""
+    try:
+        doc = ExtractionDocument.model_validate_json(raw)
+    except Exception:
+        return ChunkExtraction(chunk_index=chunk_index, entity=None)
+    return document_to_extraction(chunk_index, doc)
 
 
 def extract_chunk(
@@ -73,8 +86,7 @@ def extract_chunk(
         source_name=source_name, chunk_index=chunk_index, chunk_text=chunk_text
     )
     response = agent.model.invoke(messages)
-    tool_calls = getattr(response, "tool_calls", None) or []
-    return tool_calls_to_extraction(chunk_index, tool_calls)
+    return _parse_extraction(chunk_index, getattr(response, "content", "") or "")
 
 
 def extract_document(

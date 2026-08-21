@@ -48,6 +48,17 @@ def _coerce_confidence(raw: object) -> float:
         return 0.0
 
 
+def _strip_code_fence(text: str) -> str:
+    """Defensively strip a ```json ... ``` wrapper if present (free-form
+    output is more likely to carry one than json_object mode)."""
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    inner_lines = lines[1:-1] if len(lines) >= 2 and lines[-1].startswith("```") else lines[1:]
+    return "\n".join(inner_lines).strip()
+
+
 def parse_llm_response(raw_text: str) -> Classification:
     """Parse the LLM's JSON response into a validated Classification.
 
@@ -56,7 +67,7 @@ def parse_llm_response(raw_text: str) -> Classification:
     raising, so a single bad model response can never crash the graph.
     """
     try:
-        payload = json.loads(raw_text)
+        payload = json.loads(_strip_code_fence(raw_text))
     except (json.JSONDecodeError, TypeError):
         return _SAFE_FALLBACK
 

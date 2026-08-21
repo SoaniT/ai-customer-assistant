@@ -73,6 +73,39 @@ async def claim_next_job(session: AsyncSession) -> JobRef | None:
     )
 
 
+async def claim_job(session: AsyncSession, job_id: UUID) -> JobRef | None:
+    """
+    Claim a SPECIFIC queued job (QUEUED -> RUNNING), atomically. Returns
+    None if the job is no longer QUEUED (already claimed by the worker, or
+    already completed). The API's in-process runner calls this before
+    executing, so it claims the job exactly like the worker does -- without
+    it, the same QUEUED job would be processed by BOTH the in-process task
+    and the worker, double-writing chunks (see the double-consumption bug).
+    """
+    stmt = (
+        select(KnowledgeInjectionJob)
+        .where(KnowledgeInjectionJob.job_id == job_id, KnowledgeInjectionJob.status == "QUEUED")
+        .with_for_update()
+    )
+    row = (await session.execute(stmt)).scalar_one_or_none()
+    if row is None:
+        return None
+
+    row.status = "RUNNING"
+    row.started_at = datetime.now(UTC)
+    await session.flush()
+    await session.commit()
+
+    return JobRef(
+        job_id=row.job_id,
+        source_id=row.source_id,
+        version_id=row.version_id,
+        job_type=JobType(row.job_type),
+        status=JobStatus(row.status),
+        triggered_by=row.triggered_by,
+    )
+
+
 async def load_source(session: AsyncSession, source_id: UUID) -> SourceRef:
     row = await session.get(KnowledgeSource, source_id)
     return SourceRef(
