@@ -18,7 +18,7 @@ from ingestion.chunk_embed.chunking import UnknownSourceTypeError
 from ingestion.chunk_embed.embedding import EmbeddingGenerationError
 from ingestion.chunk_embed.pipeline import process_document
 from ingestion.chunk_embed.types import HeadingMarker
-from backend.tests.chunk_embed.conftest import FakeEmbeddingModel, make_document
+from tests.chunk_embed.conftest import FakeEmbeddingModel, make_document
 
 
 class TestFullFlow:
@@ -221,3 +221,4 @@ class TestErrorsPropagateUnwrapped:
                 long_form_source_types=long_form_source_types,
                 structured_source_types=structured_source_types,
             )
+

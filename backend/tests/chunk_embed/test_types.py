@@ -7,7 +7,7 @@ import dataclasses
 import pytest
 
 from ingestion.chunk_embed.types import Chunk, EmbeddedChunk, ExtractedDocument, HeadingMarker
-from backend.tests.chunk_embed.conftest import make_chunk, make_document
+from tests.chunk_embed.conftest import make_chunk, make_document
 
 
 class TestHeadingMarker:
@@ -97,3 +97,4 @@ class TestEmbeddedChunk:
         chunk = make_chunk()
         embedded = EmbeddedChunk(chunk=chunk, embedding=(0.0,) * 768)
         assert isinstance(embedded.embedding, tuple)
+

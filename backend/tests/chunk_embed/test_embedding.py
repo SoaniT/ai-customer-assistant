@@ -10,7 +10,7 @@ from ingestion.chunk_embed.embedding import (
     EmptyChunkTextError,
     embed_chunks,
 )
-from backend.tests.chunk_embed.conftest import FakeEmbeddingModel, make_chunk
+from tests.chunk_embed.conftest import FakeEmbeddingModel, make_chunk
 
 
 class TestEmptyInput:
@@ -165,3 +165,4 @@ class TestDimensionMismatch:
             embed_chunks(
                 chunks, model=wrong_dim_model, normalize_embeddings=True, expected_dimension=768
             )
+

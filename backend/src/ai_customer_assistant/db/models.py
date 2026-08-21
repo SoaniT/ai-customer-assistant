@@ -81,6 +81,10 @@ class Attribute(Base):
 class Value(Base):
     __tablename__ = "value"
 
+    __table_args__ = (
+        UniqueConstraint("entity_id", "attribute_id", "value", name="uq_value_entity_attribute_value"),
+    )
+
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
     entity_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("entity.id", ondelete="CASCADE"), nullable=False, index=True
@@ -98,6 +102,12 @@ class Value(Base):
 
 class Relation(Base):
     __tablename__ = "relation"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "source_entity_id", "target_entity_id", "relation_type", name="uq_relation_source_target_type"
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
     source_entity_id: Mapped[uuid.UUID] = mapped_column(
@@ -310,3 +320,19 @@ class KnowledgeInjectionJob(Base):
 
     source: Mapped["KnowledgeSource"] = relationship(back_populates="jobs")
     version: Mapped["KnowledgeSourceVersion | None"] = relationship(back_populates="jobs")
+
+
+TicketStatusEnum = SAEnum("OPEN", "IN_PROGRESS", "RESOLVED", name="ticket_status")
+
+
+class Ticket(Base):
+    __tablename__ = "ticket"
+
+    ticket_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    query: Mapped[str] = mapped_column(Text, nullable=False)
+    priority: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    status: Mapped[str] = mapped_column(TicketStatusEnum, nullable=False, server_default="OPEN")
+    created_at: Mapped[datetime] = mapped_column(nullable=False, server_default=func.now())
